@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Environment / secrets (NEVER commit private keys)
+.env
+*.key
+
+# Node
+node_modules/
+
+# Compiled contract artifacts
+build/
+artifacts/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# PowerPoint temp files
+~$*.pptx
