@@ -26,6 +26,9 @@ contract FarmToKitchen {
         string  lotCode;          // supplier lot code
         uint256 expiryDate;       // unix timestamp
         bytes32 certificateHash;  // Keccak-256 hash of the certificate stored off-chain
+        uint256 tempReadings;     // number of temperature readings recorded
+        int16   highestTempC;     // highest temperature recorded during transport
+        bool    coldChainBroken;  // true if any reading was above maxTempC
         Status  status;
         uint256 createdAt;
     }
@@ -47,6 +50,12 @@ contract FarmToKitchen {
     event OrderPlaced(uint256 indexed id, address indexed kitchen, address indexed supplier,
                       string product, uint256 payment);
     event BatchDispatched(uint256 indexed id, string origin, string lotCode, bytes32 certificateHash);
+    event TemperatureRecorded(uint256 indexed id, int16 temperatureC, bool withinLimit);
+    event BatchDelivered(uint256 indexed id);
+    event DeliveryAccepted(uint256 indexed id, address indexed supplier, uint256 amountPaid);
+    event DeliveryRejected(uint256 indexed id, address indexed kitchen, uint256 amountRefunded,
+                           bool coldChainBroken);
+    event BatchRecalled(uint256 indexed id, string reason);
 
     // ---------------------------------------------------------------
     // 4. MODIFIERS (access control)
@@ -59,6 +68,16 @@ contract FarmToKitchen {
 
     modifier batchExists(uint256 _id) {
         require(_id > 0 && _id <= batchCount, "Batch does not exist");
+        _;
+    }
+
+    modifier onlyBatchSupplier(uint256 _id) {
+        require(msg.sender == batches[_id].supplier, "Only the supplier of this batch can do this");
+        _;
+    }
+
+    modifier onlyBatchKitchen(uint256 _id) {
+        require(msg.sender == batches[_id].kitchen, "Only the kitchen of this batch can do this");
         _;
     }
 
@@ -79,7 +98,7 @@ contract FarmToKitchen {
         emit SupplierRegistered(_supplier);
     }
 
-    /// Kitchen (receiver) places an order and sends the payment, which stays in escrow
+    /// STEP 1 - Kitchen (receiver) places an order and sends the payment, which stays in escrow
     function placeOrder(
         address _supplier,
         string calldata _product,
@@ -106,16 +125,15 @@ contract FarmToKitchen {
         return batchCount;
     }
 
-    /// Supplier (sender) dispatches the batch and records its traceability data
+    /// STEP 2 - Supplier (sender) dispatches the batch and records its traceability data
     function dispatchBatch(
         uint256 _id,
         string calldata _origin,
         string calldata _lotCode,
         uint256 _expiryDate,
         bytes32 _certificateHash
-    ) external batchExists(_id) {
+    ) external batchExists(_id) onlyBatchSupplier(_id) {
         Batch storage b = batches[_id];
-        require(msg.sender == b.supplier, "Only the supplier of this order can dispatch");
         require(b.status == Status.Ordered, "Batch is not waiting for dispatch");
         require(_expiryDate > block.timestamp, "Product is already expired");
 
@@ -128,15 +146,101 @@ contract FarmToKitchen {
         emit BatchDispatched(_id, _origin, _lotCode, _certificateHash);
     }
 
+    /// STEP 3 - Supplier records a temperature reading during transport
+    ///          (in a real system this would come from an IoT sensor through an oracle)
+    function recordTemperature(uint256 _id, int16 _temperatureC)
+        external batchExists(_id) onlyBatchSupplier(_id)
+    {
+        Batch storage b = batches[_id];
+        require(b.status == Status.Dispatched, "Batch is not in transit");
+
+        if (b.tempReadings == 0 || _temperatureC > b.highestTempC) {
+            b.highestTempC = _temperatureC;
+        }
+        b.tempReadings++;
+
+        bool withinLimit = _temperatureC <= b.maxTempC;
+        if (!withinLimit) {
+            b.coldChainBroken = true;   // cannot be undone: the record is permanent
+        }
+
+        emit TemperatureRecorded(_id, _temperatureC, withinLimit);
+    }
+
+    /// STEP 4 - Supplier confirms the batch arrived at the kitchen
+    function markDelivered(uint256 _id) external batchExists(_id) onlyBatchSupplier(_id) {
+        Batch storage b = batches[_id];
+        require(b.status == Status.Dispatched, "Batch is not in transit");
+        require(b.tempReadings > 0, "At least one temperature reading is required");
+
+        b.status = Status.Delivered;
+        emit BatchDelivered(_id);
+    }
+
+    /// STEP 5 - Kitchen inspects the delivery and accepts or rejects it.
+    ///   - accepted AND cold chain respected -> payment released to the supplier
+    ///   - rejected OR cold chain broken     -> payment refunded to the kitchen
+    function confirmDelivery(uint256 _id, bool _accept)
+        external batchExists(_id) onlyBatchKitchen(_id)
+    {
+        Batch storage b = batches[_id];
+        require(b.status == Status.Delivered, "Batch has not been delivered yet");
+
+        uint256 amount = b.payment;
+        b.payment = 0;   // update state BEFORE sending ETH (protection against re-entrancy)
+
+        if (_accept && !b.coldChainBroken) {
+            b.status = Status.Accepted;
+            (bool ok, ) = payable(b.supplier).call{value: amount}("");
+            require(ok, "Payment to supplier failed");
+            emit DeliveryAccepted(_id, b.supplier, amount);
+        } else {
+            b.status = Status.Rejected;
+            (bool ok, ) = payable(b.kitchen).call{value: amount}("");
+            require(ok, "Refund to kitchen failed");
+            emit DeliveryRejected(_id, b.kitchen, amount, b.coldChainBroken);
+        }
+    }
+
+    /// Regulator recalls a batch (e.g. contamination found).
+    /// If the payment is still in escrow, it is refunded to the kitchen.
+    function recallBatch(uint256 _id, string calldata _reason)
+        external onlyRegulator batchExists(_id)
+    {
+        Batch storage b = batches[_id];
+        require(b.status != Status.Recalled, "Batch already recalled");
+
+        b.status = Status.Recalled;
+        uint256 amount = b.payment;
+        if (amount > 0) {
+            b.payment = 0;
+            (bool ok, ) = payable(b.kitchen).call{value: amount}("");
+            require(ok, "Refund to kitchen failed");
+        }
+
+        emit BatchRecalled(_id, _reason);
+    }
+
+    // ---------------------------------------------------------------
+    // 6. VIEW / HELPER FUNCTIONS (free to call, no transaction)
+    // ---------------------------------------------------------------
+
     /// Anyone (inspector, customer) can read the full record of a batch
     function getBatch(uint256 _id) external view batchExists(_id) returns (Batch memory) {
         return batches[_id];
     }
 
-    /// Helper: calculates the Keccak-256 hash of a document text (e.g. a certificate).
+    /// Calculates the Keccak-256 hash of a document text (e.g. a certificate).
     /// In a real system the file is stored off-chain and only this hash goes on-chain.
     function hashDocument(string calldata _document) external pure returns (bytes32) {
         return keccak256(abi.encodePacked(_document));
+    }
+
+    /// Checks if a document matches the hash stored for a batch (tamper detection)
+    function verifyCertificate(uint256 _id, string calldata _document)
+        external view batchExists(_id) returns (bool)
+    {
+        return keccak256(abi.encodePacked(_document)) == batches[_id].certificateHash;
     }
 
     /// Total ETH currently held in escrow by the contract
