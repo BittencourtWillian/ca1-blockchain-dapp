@@ -5,8 +5,7 @@
 **Student name:** _<Willian Cesar Lino Bittencourt>_
 **Student number:** _<2024419>_
 **GitHub repository:** _<https://github.com/BittencourtWillian/ca1-blockchain-dapp.git>_
-
----
+**Link Video of Poster** <https://drive.google.com/drive/folders/1sdmuRW02Dql91I_96Y-R-wKIjcG5r3wX?usp=sharing>
 
 ## 1. Overview
 
